@@ -1,37 +1,165 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  AWS Backup restore testing helper for Aurora. When a restore-testing job completes,
-  adds a writer instance to the restored (instance-less) cluster, validates it,
-  reports the result to AWS Backup, then deletes the instance so Backup can clean up the cluster.
+  AWS Backup restore testing validation for RDS PostgreSQL, RDS Oracle and Aurora.
+  RDS instances: wait until the restored instance is available, validate, report.
+  Aurora clusters: add a temporary writer, validate, report, delete the writer.
+  EventBridge -> Step Functions with retries, DLQ, de-duplication, logs and alarms.
+
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks: [W1030]  # SubnetIds default "" is only used when VpcId is set (enforced by Rules)
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Scope }
+        Parameters: [RestoreTestingPlanArn, ResourceTypes, AllowedEngines]
+      - Label: { default: Behaviour }
+        Parameters: [AuroraInstanceClass, MaxWaitMinutes]
+      - Label: { default: "SQL checks: networking (leave VpcId empty to skip SQL checks)" }
+        Parameters: [VpcId, SubnetIds, DatabaseSecurityGroupId, CreateVpcEndpoints, RouteTableIds]
+      - Label: { default: "SQL checks: credentials and queries" }
+        Parameters: [PostgresSecretArn, OracleSecretArn, SecretsKmsKeyArn, DriverLayerArn, PostgresDatabase, OracleServiceName, PostgresCheckSql, OracleCheckSql]
+      - Label: { default: Alerting }
+        Parameters: [AlarmTopicArn]
 
 Parameters:
-  InstanceClass:
-    Type: String
-    Default: db.r6g.large
-    Description: Instance class for the temporary writer (use db.serverless only if the cluster has a Serverless v2 scaling config).
   RestoreTestingPlanArn:
     Type: String
     Default: ""
-    Description: Optional. Only handle jobs from this restore testing plan. Leave empty to handle all plans.
+    Description: Optional. Only handle jobs from this restore testing plan. Empty = any restore testing plan (manual restores are always ignored).
+  ResourceTypes:
+    Type: CommaDelimitedList
+    Default: "RDS,Aurora"
+    Description: AWS Backup resource types to handle. RDS = RDS DB instances, Aurora = Aurora clusters.
+  AllowedEngines:
+    Type: CommaDelimitedList
+    Default: "postgres,oracle-ee,oracle-ee-cdb,oracle-se2,oracle-se2-cdb,aurora-postgresql"
+    Description: RDS engine names to validate. Restores of other engines are ignored.
+  AuroraInstanceClass:
+    Type: String
+    Default: db.r6g.large
+    Description: Class of the temporary writer added to restored Aurora clusters.
   MaxWaitMinutes:
     Type: Number
-    Default: 45
+    Default: 60
     MinValue: 5
-    Description: How long to wait for the instance to become available before marking the test FAILED.
+    MaxValue: 600
+    Description: How long to wait for the DB instance to become available before reporting FAILED. Keep this below the plan's validation window.
+
+  # ---- SQL checks: networking
+  VpcId:
+    Type: String
+    Default: ""
+    Description: Optional. VPC where restored databases land. Setting it runs the Lambda in the VPC and enables SQL checks.
   SubnetIds:
     Type: CommaDelimitedList
     Default: ""
-    Description: Optional. Put the Lambda in a VPC (needed only if you add SQL checks). Needs NAT or VPC endpoints for RDS and Backup APIs.
-  SecurityGroupIds:
+    Description: Private subnets for the Lambda (and the VPC endpoints). Required when VpcId is set.
+  DatabaseSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: Optional. Security group on the restored databases (set it via the vpcSecurityGroupIds restore metadata override). The stack allows 5432 and 1521 into it from the Lambda.
+  CreateVpcEndpoints:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "true if the subnets have NO NAT gateway: creates endpoints for Backup, RDS, Secrets Manager (interface) and DynamoDB (gateway)."
+  RouteTableIds:
     Type: CommaDelimitedList
     Default: ""
-    Description: Optional. Security groups for the Lambda when SubnetIds is set.
+    Description: Route tables of the Lambda subnets, for the DynamoDB gateway endpoint. Required when CreateVpcEndpoints is true.
+
+  # ---- SQL checks: credentials and queries
+  PostgresSecretArn:
+    Type: String
+    Default: ""
+    Description: Optional. Secrets Manager secret with {"username","password"} for PostgreSQL / Aurora PostgreSQL restores. Empty = no SQL check for PostgreSQL.
+  OracleSecretArn:
+    Type: String
+    Default: ""
+    Description: Optional. Secrets Manager secret with {"username","password"} for Oracle restores. Empty = no SQL check for Oracle.
+  SecretsKmsKeyArn:
+    Type: String
+    Default: ""
+    Description: Optional. Customer-managed KMS key that encrypts those secrets (leave empty for the AWS-managed key).
+  DriverLayerArn:
+    Type: String
+    Default: ""
+    Description: Lambda layer ARN containing pg8000 and oracledb (see build-driver-layer.sh). Required for SQL checks.
+  PostgresDatabase:
+    Type: String
+    Default: postgres
+    Description: Database to connect to on PostgreSQL restores.
+  OracleServiceName:
+    Type: String
+    Default: ""
+    Description: Oracle service name. Empty = the instance's DBName (e.g. ORCL). For CDB, set the PDB service name.
+  PostgresCheckSql:
+    Type: String
+    Default: "SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')"
+    Description: Query that must return a first column that is truthy / greater than 0.
+  OracleCheckSql:
+    Type: String
+    Default: "SELECT count(*) FROM all_tables WHERE owner NOT IN (SELECT username FROM all_users WHERE oracle_maintained = 'Y')"
+    Description: Query that must return a first column that is truthy / greater than 0.
+
+  AlarmTopicArn:
+    Type: String
+    Default: ""
+    Description: Optional. SNS topic for alarms (rule delivery failures, DLQ messages, failed validations).
+
+Rules:
+  VpcNeedsSubnets:
+    RuleCondition: !Not [!Equals [!Ref VpcId, ""]]
+    Assertions:
+      - Assert: !Not [!EachMemberEquals [!Ref SubnetIds, ""]]
+        AssertDescription: SubnetIds is required when VpcId is set.
+      - Assert: !Not [!Equals [!Ref DriverLayerArn, ""]]
+        AssertDescription: DriverLayerArn is required when VpcId is set (SQL checks need pg8000 / oracledb).
+  EndpointsNeedRouteTables:
+    RuleCondition: !Equals [!Ref CreateVpcEndpoints, "true"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref VpcId, ""]]
+        AssertDescription: CreateVpcEndpoints needs VpcId.
+      - Assert: !Not [!EachMemberEquals [!Ref RouteTableIds, ""]]
+        AssertDescription: RouteTableIds is required when CreateVpcEndpoints is true (DynamoDB gateway endpoint).
 
 Conditions:
-  UseVpc: !Not [!Equals [!Join ["", !Ref SubnetIds], ""]]
+  UseVpc: !Not [!Equals [!Ref VpcId, ""]]
+  HasPlan: !Not [!Equals [!Ref RestoreTestingPlanArn, ""]]
+  HasTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
+  HasPgSecret: !Not [!Equals [!Ref PostgresSecretArn, ""]]
+  HasOraSecret: !Not [!Equals [!Ref OracleSecretArn, ""]]
+  HasAnySecret: !Or [!Condition HasPgSecret, !Condition HasOraSecret]
+  HasKms: !Not [!Equals [!Ref SecretsKmsKeyArn, ""]]
+  HasLayer: !Not [!Equals [!Ref DriverLayerArn, ""]]
+  HasDbSg: !And [!Condition UseVpc, !Not [!Equals [!Ref DatabaseSecurityGroupId, ""]]]
+  NoDbSg: !And [!Condition UseVpc, !Equals [!Ref DatabaseSecurityGroupId, ""]]
+  MakeEndpoints: !And [!Condition UseVpc, !Equals [!Ref CreateVpcEndpoints, "true"]]
+  MakeSmEndpoint: !And [!Condition MakeEndpoints, !Condition HasAnySecret]
 
 Resources:
-  # ---------------------------------------------------------------- Lambda
+  # ------------------------------------------------------------------ De-duplication
+  # AWS Backup events are best effort and can be delivered more than once.
+  DedupTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: restoreJobId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: restoreJobId, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  # ------------------------------------------------------------------ Lambda
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-worker
+      RetentionInDays: 30
+
   WorkerRole:
     Type: AWS::IAM::Role
     Properties:
@@ -44,8 +172,8 @@ Resources:
       ManagedPolicyArns:
         - !If
           - UseVpc
-          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
-          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+          - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+          - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
         - PolicyName: restore-test-worker
           PolicyDocument:
@@ -57,9 +185,6 @@ Resources:
                   - backup:PutRestoreValidationResult
                   - rds:DescribeDBClusters
                   - rds:DescribeDBInstances
-                Resource: "*"
-              - Effect: Allow
-                Action:
                   - rds:CreateDBInstance
                   - rds:AddTagsToResource
                 Resource: "*"
@@ -70,11 +195,41 @@ Resources:
                 Condition:
                   StringEquals:
                     "rds:db-tag/restore-test-automation": "true"
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt DedupTable.Arn
+        - !If
+          - HasAnySecret
+          - PolicyName: read-db-secrets
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource:
+                    - !If [HasPgSecret, !Ref PostgresSecretArn, !Ref AWS::NoValue]
+                    - !If [HasOraSecret, !Ref OracleSecretArn, !Ref AWS::NoValue]
+          - !Ref AWS::NoValue
+        - !If
+          - HasKms
+          - PolicyName: decrypt-db-secrets
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref SecretsKmsKeyArn
+                  Condition:
+                    StringEquals:
+                      kms:ViaService: !Sub secretsmanager.${AWS::Region}.amazonaws.com
+          - !Ref AWS::NoValue
 
   WorkerFunction:
     Type: AWS::Lambda::Function
+    DependsOn: WorkerLogGroup
     Properties:
-      Description: Aurora restore-test worker (prepare/create/status/validate/report/delete)
+      FunctionName: !Sub ${AWS::StackName}-worker
+      Description: Restore-test worker (prepare/create/status/validate/report/delete)
       Runtime: python3.13
       Handler: index.handler
       Timeout: 300
@@ -82,72 +237,213 @@ Resources:
       Role: !GetAtt WorkerRole.Arn
       Environment:
         Variables:
-          INSTANCE_CLASS: !Ref InstanceClass
           PLAN_ARN: !Ref RestoreTestingPlanArn
+          RESOURCE_TYPES: !Join [",", !Ref ResourceTypes]
+          ENGINES: !Join [",", !Ref AllowedEngines]
+          AURORA_INSTANCE_CLASS: !Ref AuroraInstanceClass
           MAX_ATTEMPTS: !Ref MaxWaitMinutes
+          DEDUP_TABLE: !Ref DedupTable
+          SQL_CHECKS: !If [UseVpc, "true", "false"]
+          PG_SECRET_ARN: !Ref PostgresSecretArn
+          ORA_SECRET_ARN: !Ref OracleSecretArn
+          PG_DATABASE: !Ref PostgresDatabase
+          ORA_SERVICE: !Ref OracleServiceName
+          PG_CHECK_SQL: !Ref PostgresCheckSql
+          ORA_CHECK_SQL: !Ref OracleCheckSql
+          RDS_CA_BUNDLE: /opt/rds-global-bundle.pem
+      Layers: !If [HasLayer, [!Ref DriverLayerArn], !Ref AWS::NoValue]
       VpcConfig: !If
         - UseVpc
         - SubnetIds: !Ref SubnetIds
-          SecurityGroupIds: !Ref SecurityGroupIds
+          SecurityGroupIds: [!Ref ValidatorSecurityGroup]
         - !Ref AWS::NoValue
       Code:
         ZipFile: |
-          import os, boto3
+          import os, json, ssl, time, boto3
+
           bk = boto3.client('backup')
           rds = boto3.client('rds')
+          ddb = boto3.client('dynamodb')
+          sm = boto3.client('secretsmanager')
           TAG = 'restore-test-automation'
+
 
           class NotReady(Exception):
               pass
 
-          def handler(e, _):
-              return globals()['do_' + e['action']](e.get('ctx', e))
 
-          def do_prepare(c):
-              j = bk.describe_restore_job(RestoreJobId=c['restoreJobId'])
+          def env_list(name):
+              return [x.strip() for x in os.environ.get(name, '').split(',') if x.strip()]
+
+
+          def handler(event, _):
+              return ACTIONS[event['action']](event.get('ctx', event))
+
+
+          def skip(reason):
+              print('skip:', reason)
+              return {'skip': True, 'reason': reason}
+
+
+          def prepare(c):
+              job_id = c['restoreJobId']
+              j = bk.describe_restore_job(RestoreJobId=job_id)
               plan = (j.get('CreatedBy') or {}).get('RestoreTestingPlanArn')
+              rtype = j.get('ResourceType')
+              arn = j.get('CreatedResourceArn') or ''
               want = os.environ.get('PLAN_ARN')
-              arn = j.get('CreatedResourceArn', '')
-              if not plan or (want and plan != want) or ':cluster:' not in arn:
-                  return {'skip': True}
-              cid = arn.split(':')[-1]
-              cl = rds.describe_db_clusters(DBClusterIdentifier=cid)['DBClusters'][0]
-              if not cl['Engine'].startswith('aurora'):
-                  return {'skip': True}
-              return {'skip': False, 'restoreJobId': c['restoreJobId'],
-                      'clusterId': cid, 'engine': cl['Engine'], 'attempts': 0,
-                      'maxAttempts': int(os.environ['MAX_ATTEMPTS']),
-                      'instanceId': cid[:55].rstrip('-').lower() + '-rt'}
+              if not plan:
+                  return skip('not a restore testing job')
+              if want and plan != want:
+                  return skip('different restore testing plan')
+              if rtype not in env_list('RESOURCE_TYPES'):
+                  return skip(f'resource type {rtype} not handled')
+              if j.get('Status') != 'COMPLETED':
+                  return skip(f"restore job status {j.get('Status')}")
 
-          def do_create(c):
+              rid = arn.split(':')[-1]
+              if rtype == 'Aurora':
+                  engine = rds.describe_db_clusters(DBClusterIdentifier=rid)['DBClusters'][0]['Engine']
+                  ctx = {'addInstance': True, 'clusterId': rid,
+                         'instanceId': rid[:55].rstrip('-').lower() + '-rt'}
+              else:
+                  engine = rds.describe_db_instances(DBInstanceIdentifier=rid)['DBInstances'][0]['Engine']
+                  ctx = {'addInstance': False, 'clusterId': None, 'instanceId': rid}
+              if engine not in env_list('ENGINES'):
+                  return skip(f'engine {engine} not handled')
+
+              # Lock the job so duplicate events do not start a second test.
+              try:
+                  ddb.put_item(
+                      TableName=os.environ['DEDUP_TABLE'],
+                      Item={'restoreJobId': {'S': job_id},
+                            'owner': {'S': c['executionName']},
+                            'expiresAt': {'N': str(int(time.time()) + 30 * 86400)}},
+                      ConditionExpression='attribute_not_exists(restoreJobId) OR #o = :me',
+                      ExpressionAttributeNames={'#o': 'owner'},
+                      ExpressionAttributeValues={':me': {'S': c['executionName']}})
+              except ddb.exceptions.ConditionalCheckFailedException:
+                  return skip('duplicate event, job already handled')
+
+              ctx.update({'skip': False, 'restoreJobId': job_id, 'resourceType': rtype,
+                          'engine': engine, 'attempts': 0,
+                          'maxAttempts': int(os.environ['MAX_ATTEMPTS'])})
+              return ctx
+
+
+          def create(c):
               try:
                   rds.create_db_instance(
                       DBInstanceIdentifier=c['instanceId'],
                       DBClusterIdentifier=c['clusterId'],
-                      DBInstanceClass=os.environ['INSTANCE_CLASS'],
+                      DBInstanceClass=os.environ['AURORA_INSTANCE_CLASS'],
                       Engine=c['engine'],
                       Tags=[{'Key': TAG, 'Value': 'true'}])
               except rds.exceptions.DBInstanceAlreadyExistsFault:
                   pass
               return {}
 
-          def do_status(c):
+
+          def status(c):
               try:
-                  i = rds.describe_db_instances(DBInstanceIdentifier=c['instanceId'])
-                  return {'status': i['DBInstances'][0]['DBInstanceStatus']}
+                  i = rds.describe_db_instances(DBInstanceIdentifier=c['instanceId'])['DBInstances'][0]
+                  return {'status': i['DBInstanceStatus']}
               except rds.exceptions.DBInstanceNotFoundFault:
                   return {'status': 'not-found'}
 
-          def do_validate(c):
-              cl = rds.describe_db_clusters(DBClusterIdentifier=c['clusterId'])['DBClusters'][0]
-              writer = any(m['IsClusterWriter'] for m in cl['DBClusterMembers'])
-              ok = cl['Status'] == 'available' and writer
-              # Add your own checks here, e.g. connect to cl['Endpoint'] and
-              # run queries (requires VPC config + a DB driver layer).
-              return {'status': 'SUCCESSFUL' if ok else 'FAILED',
-                      'message': f"cluster={cl['Status']} writer={writer} endpoint={cl.get('Endpoint')}"}
 
-          def do_report(c):
+          def secret(arn):
+              v = json.loads(sm.get_secret_value(SecretId=arn)['SecretString'])
+              return v['username'], v['password']
+
+
+          def first_value_ok(row):
+              if not row:
+                  return False, 'query returned no rows'
+              v = row[0]
+              ok = bool(v) and not (isinstance(v, (int, float)) and v <= 0)
+              return ok, f'check query returned {v}'
+
+
+          def check_postgres(host, port):
+              import pg8000.native
+              user, pw = secret(os.environ['PG_SECRET_ARN'])
+              ctx = ssl.create_default_context()
+              ca = os.environ.get('RDS_CA_BUNDLE')
+              if ca and os.path.exists(ca):
+                  ctx.load_verify_locations(ca)
+              else:  # still encrypted, but the server certificate is not verified
+                  ctx.check_hostname = False
+                  ctx.verify_mode = ssl.CERT_NONE
+              conn = pg8000.native.Connection(user, host=host, port=port, password=pw,
+                                              database=os.environ['PG_DATABASE'],
+                                              ssl_context=ctx, timeout=15)
+              try:
+                  conn.run('SELECT 1')
+                  rows = conn.run(os.environ['PG_CHECK_SQL'])
+                  return first_value_ok(rows[0] if rows else None)
+              finally:
+                  conn.close()
+
+
+          def check_oracle(host, port, db_name):
+              import oracledb  # thin mode, no Instant Client needed
+              user, pw = secret(os.environ['ORA_SECRET_ARN'])
+              service = os.environ.get('ORA_SERVICE') or db_name
+              conn = oracledb.connect(user=user, password=pw, dsn=f'{host}:{port}/{service}',
+                                      tcp_connect_timeout=15)
+              try:
+                  cur = conn.cursor()
+                  cur.execute('SELECT 1 FROM dual')
+                  cur.execute(os.environ['ORA_CHECK_SQL'])
+                  return first_value_ok(cur.fetchone())
+              finally:
+                  conn.close()
+
+
+          def custom_checks(c, host, port, db_name):
+              """Returns (ok, message). Runs only when the Lambda is in the VPC and a secret is set."""
+              if os.environ.get('SQL_CHECKS') != 'true':
+                  return True, 'API checks only'
+              engine = c['engine']
+              try:
+                  if engine in ('postgres', 'aurora-postgresql') and os.environ.get('PG_SECRET_ARN'):
+                      return check_postgres(host, port)
+                  if engine.startswith('oracle') and os.environ.get('ORA_SECRET_ARN'):
+                      return check_oracle(host, port, db_name)
+              except Exception as e:
+                  return False, f'SQL check error: {type(e).__name__}: {e}'
+              return True, 'no SQL check configured for this engine'
+
+
+          def validate(c):
+              i = rds.describe_db_instances(DBInstanceIdentifier=c['instanceId'])['DBInstances'][0]
+              ep = i.get('Endpoint') or {}
+              problems = []
+              if i['DBInstanceStatus'] != 'available':
+                  problems.append(f"instance {i['DBInstanceStatus']}")
+              if not ep.get('Address'):
+                  problems.append('no endpoint')
+              if c['addInstance']:
+                  cl = rds.describe_db_clusters(DBClusterIdentifier=c['clusterId'])['DBClusters'][0]
+                  if cl['Status'] != 'available':
+                      problems.append(f"cluster {cl['Status']}")
+                  if not any(m['IsClusterWriter'] for m in cl['DBClusterMembers']):
+                      problems.append('no writer')
+                  host, port, db_name = cl.get('Endpoint'), cl.get('Port'), cl.get('DatabaseName')
+              else:
+                  host, port, db_name = ep.get('Address'), ep.get('Port'), i.get('DBName')
+              note = ''
+              if not problems:
+                  ok, note = custom_checks(c, host, port, db_name)
+                  if not ok:
+                      problems.append(note or 'custom checks failed')
+              if problems:
+                  return {'status': 'FAILED', 'message': f"{c['engine']}: " + '; '.join(problems)}
+              return {'status': 'SUCCESSFUL', 'message': f"{c['engine']} at {host}:{port} ok ({note})"}
+
+
+          def report(c):
               v = c['validation']
               bk.put_restore_validation_result(
                   RestoreJobId=c['restoreJobId'],
@@ -155,7 +451,10 @@ Resources:
                   ValidationStatusMessage=v['message'][:250])
               return {}
 
-          def do_delete(c):
+
+          def delete(c):
+              if not c.get('addInstance'):
+                  return {}
               try:
                   rds.delete_db_instance(DBInstanceIdentifier=c['instanceId'])
               except rds.exceptions.DBInstanceNotFoundFault:
@@ -164,7 +463,146 @@ Resources:
                   raise NotReady('instance busy, retrying')
               return {}
 
-  # ---------------------------------------------------------------- Step Functions
+
+          ACTIONS = {'prepare': prepare, 'create': create, 'status': status,
+                     'validate': validate, 'report': report, 'delete': delete}
+
+  # ------------------------------------------------------------------ Networking (SQL checks)
+  ValidatorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: UseVpc
+    Properties:
+      GroupDescription: Restore-test validator Lambda
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: AWS APIs (NAT or VPC endpoints) }
+
+  # Database ports: only towards the restored-DB security group when given, else anywhere in routing reach.
+  ValidatorEgressPgToDb:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: HasDbSg
+    Properties:
+      GroupId: !Ref ValidatorSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DatabaseSecurityGroupId
+      Description: PostgreSQL to restored databases
+  ValidatorEgressOraToDb:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: HasDbSg
+    Properties:
+      GroupId: !Ref ValidatorSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1521
+      ToPort: 1521
+      DestinationSecurityGroupId: !Ref DatabaseSecurityGroupId
+      Description: Oracle to restored databases
+  ValidatorEgressPgAny:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: NoDbSg
+    Properties:
+      GroupId: !Ref ValidatorSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      CidrIp: 0.0.0.0/0
+      Description: PostgreSQL
+  ValidatorEgressOraAny:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: NoDbSg
+    Properties:
+      GroupId: !Ref ValidatorSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1521
+      ToPort: 1521
+      CidrIp: 0.0.0.0/0
+      Description: Oracle
+
+  # Opens the restored-DB security group to the Lambda (and only the Lambda).
+  DbIngressPg:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasDbSg
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref ValidatorSecurityGroup
+      Description: Restore-test validator Lambda (PostgreSQL)
+  DbIngressOra:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasDbSg
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 1521
+      ToPort: 1521
+      SourceSecurityGroupId: !Ref ValidatorSecurityGroup
+      Description: Restore-test validator Lambda (Oracle)
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: MakeEndpoints
+    Properties:
+      GroupDescription: Interface endpoints used by the restore-test validator
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ValidatorSecurityGroup
+          Description: HTTPS from validator Lambda
+
+  BackupEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: MakeEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.backup
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  RdsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: MakeEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.rds
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: MakeSmEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  DynamoDbEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: MakeEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcEndpointType: Gateway
+      RouteTableIds: !Ref RouteTableIds
+
+  # ------------------------------------------------------------------ Step Functions
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/vendedlogs/states/${AWS::StackName}
+      RetentionInDays: 30
+
   StateMachineRole:
     Type: AWS::IAM::Role
     Properties:
@@ -175,7 +613,7 @@ Resources:
             Principal: { Service: states.amazonaws.com }
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: invoke-worker
+        - PolicyName: state-machine
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -184,16 +622,34 @@ Resources:
                 Resource:
                   - !GetAtt WorkerFunction.Arn
                   - !Sub "${WorkerFunction.Arn}:*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
 
   StateMachine:
     Type: AWS::StepFunctions::StateMachine
     Properties:
+      StateMachineName: !Sub ${AWS::StackName}
       StateMachineType: STANDARD
       RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
       DefinitionSubstitutions:
         Fn: !GetAtt WorkerFunction.Arn
       Definition:
-        Comment: Add instance to restored Aurora cluster, validate, report, clean up
+        Comment: Validate AWS Backup restore tests for RDS PostgreSQL / Oracle and Aurora
         StartAt: Prepare
         States:
           Prepare:
@@ -204,10 +660,15 @@ Resources:
               Payload:
                 action: prepare
                 restoreJobId.$: $.detail.restoreJobId
+                executionName.$: $$.Execution.Name
             OutputPath: $.Payload
             Retry:
-              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
                 IntervalSeconds: 5
+                MaxAttempts: 5
+                BackoffRate: 2
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 30
                 MaxAttempts: 3
                 BackoffRate: 2
             Next: ShouldSkip
@@ -217,11 +678,19 @@ Resources:
             Choices:
               - Variable: $.skip
                 BooleanEquals: true
-                Next: NotAnAuroraRestoreTest
-            Default: CreateInstance
+                Next: Skipped
+            Default: NeedsInstance
 
-          NotAnAuroraRestoreTest:
+          Skipped:
             Type: Succeed
+
+          NeedsInstance:
+            Type: Choice
+            Choices:
+              - Variable: $.addInstance
+                BooleanEquals: true
+                Next: CreateInstance
+            Default: CheckInstance
 
           CreateInstance:
             Type: Task
@@ -231,9 +700,9 @@ Resources:
               Payload: { action: create, ctx.$: $ }
             ResultPath: null
             Retry:
-              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
                 IntervalSeconds: 5
-                MaxAttempts: 3
+                MaxAttempts: 5
                 BackoffRate: 2
             Catch:
               - ErrorEquals: [States.ALL]
@@ -256,17 +725,17 @@ Resources:
               status.$: $.Payload.status
             ResultPath: $.instance
             Retry:
-              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
                 IntervalSeconds: 5
-                MaxAttempts: 3
+                MaxAttempts: 5
                 BackoffRate: 2
             Catch:
               - ErrorEquals: [States.ALL]
                 ResultPath: $.error
                 Next: AutomationError
-            Next: IncrementAttempts
+            Next: CountAttempt
 
-          IncrementAttempts:
+          CountAttempt:
             Type: Pass
             Parameters:
               value.$: States.MathAdd($.attempts, 1)
@@ -292,9 +761,9 @@ Resources:
               - Variable: $.counter.value
                 NumericGreaterThanEqualsPath: $.maxAttempts
                 Next: InstanceTimedOut
-            Default: SaveAttempts
+            Default: SaveAttempt
 
-          SaveAttempts:
+          SaveAttempt:
             Type: Pass
             InputPath: $.counter.value
             ResultPath: $.attempts
@@ -335,9 +804,9 @@ Resources:
               message.$: $.Payload.message
             ResultPath: $.validation
             Retry:
-              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
                 IntervalSeconds: 5
-                MaxAttempts: 3
+                MaxAttempts: 5
                 BackoffRate: 2
             Catch:
               - ErrorEquals: [States.ALL]
@@ -353,15 +822,23 @@ Resources:
               Payload: { action: report, ctx.$: $ }
             ResultPath: null
             Retry:
-              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
                 IntervalSeconds: 5
-                MaxAttempts: 3
+                MaxAttempts: 5
                 BackoffRate: 2
             Catch:
               - ErrorEquals: [States.ALL]
                 ResultPath: $.reportError
+                Next: Cleanup
+            Next: Cleanup
+
+          Cleanup:
+            Type: Choice
+            Choices:
+              - Variable: $.addInstance
+                BooleanEquals: true
                 Next: DeleteInstance
-            Next: DeleteInstance
+            Default: Outcome
 
           DeleteInstance:
             Type: Task
@@ -373,19 +850,22 @@ Resources:
             Retry:
               - ErrorEquals: [NotReady]
                 IntervalSeconds: 60
-                MaxAttempts: 45
+                MaxAttempts: 60
                 BackoffRate: 1
-              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+              - ErrorEquals: [Lambda.ServiceException, Lambda.AWSLambdaException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
                 IntervalSeconds: 5
-                MaxAttempts: 3
+                MaxAttempts: 5
                 BackoffRate: 2
             Next: Outcome
 
           Outcome:
             Type: Choice
             Choices:
-              - Variable: $.validation.status
-                StringEquals: SUCCESSFUL
+              - And:
+                  - Variable: $.validation.status
+                    StringEquals: SUCCESSFUL
+                  - Variable: $.reportError
+                    IsPresent: false
                 Next: Passed
             Default: ValidationFailed
 
@@ -395,9 +875,30 @@ Resources:
           ValidationFailed:
             Type: Fail
             Error: RestoreValidationFailed
-            Cause: Restore test validation failed; see execution input/output for details.
+            Cause: Validation failed or could not be reported to AWS Backup. See the execution input/output.
 
-  # ---------------------------------------------------------------- EventBridge
+  # ------------------------------------------------------------------ EventBridge
+  EventsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  EventsDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventsDLQ]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventsDLQ.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt RestoreCompletedRule.Arn
+
   EventsRole:
     Type: AWS::IAM::Role
     Properties:
@@ -407,6 +908,9 @@ Resources:
           - Effect: Allow
             Principal: { Service: events.amazonaws.com }
             Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
       Policies:
         - PolicyName: start-execution
           PolicyDocument:
@@ -416,23 +920,94 @@ Resources:
                 Action: states:StartExecution
                 Resource: !Ref StateMachine
 
+  # Pattern follows the AWS Backup restore testing validation docs.
+  # restoreTestingPlanArn is only present on restore-testing jobs.
   RestoreCompletedRule:
     Type: AWS::Events::Rule
     Properties:
-      Description: AWS Backup restore job completed -> Aurora restore-test validation
+      Name: !Sub ${AWS::StackName}-restore-test-completed
+      Description: AWS Backup restore testing job COMPLETED (RDS / Aurora)
+      EventBusName: default
       State: ENABLED
       EventPattern:
         source: [aws.backup]
         detail-type: [Restore Job State Change]
         detail:
           status: [COMPLETED]
+          resourceType: !Ref ResourceTypes
+          restoreTestingPlanArn: !If
+            - HasPlan
+            - [!Ref RestoreTestingPlanArn]
+            - [{ exists: true }]
       Targets:
-        - Id: aurora-restore-test
+        - Id: restore-test-validation
           Arn: !Ref StateMachine
           RoleArn: !GetAtt EventsRole.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 10
+            MaximumEventAgeInSeconds: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt EventsDLQ.Arn
+
+  # ------------------------------------------------------------------ Alarms
+  RuleFailedInvocationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: EventBridge could not start the restore-test state machine
+      Namespace: AWS/Events
+      MetricName: FailedInvocations
+      Dimensions:
+        - { Name: RuleName, Value: !Ref RestoreCompletedRule }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Restore-test events landed in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt EventsDLQ.QueueName }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  ValidationFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A restore test failed validation (or the automation failed)
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - { Name: StateMachineArn, Value: !Ref StateMachine }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
 
 Outputs:
+  ValidatorSecurityGroupId:
+    Condition: UseVpc
+    Value: !Ref ValidatorSecurityGroup
+    Description: Allow 5432/1521 from this group on the restored databases if you did not set DatabaseSecurityGroupId.
   StateMachineArn:
     Value: !Ref StateMachine
-  WorkerFunctionArn:
-    Value: !GetAtt WorkerFunction.Arn
+  RuleName:
+    Value: !Ref RestoreCompletedRule
+  DeadLetterQueueUrl:
+    Value: !Ref EventsDLQ
+  WorkerFunctionName:
+    Value: !Ref WorkerFunction
