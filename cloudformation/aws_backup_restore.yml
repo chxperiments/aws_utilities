@@ -1,0 +1,438 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AWS Backup restore testing helper for Aurora. When a restore-testing job completes,
+  adds a writer instance to the restored (instance-less) cluster, validates it,
+  reports the result to AWS Backup, then deletes the instance so Backup can clean up the cluster.
+
+Parameters:
+  InstanceClass:
+    Type: String
+    Default: db.r6g.large
+    Description: Instance class for the temporary writer (use db.serverless only if the cluster has a Serverless v2 scaling config).
+  RestoreTestingPlanArn:
+    Type: String
+    Default: ""
+    Description: Optional. Only handle jobs from this restore testing plan. Leave empty to handle all plans.
+  MaxWaitMinutes:
+    Type: Number
+    Default: 45
+    MinValue: 5
+    Description: How long to wait for the instance to become available before marking the test FAILED.
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Optional. Put the Lambda in a VPC (needed only if you add SQL checks). Needs NAT or VPC endpoints for RDS and Backup APIs.
+  SecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Optional. Security groups for the Lambda when SubnetIds is set.
+
+Conditions:
+  UseVpc: !Not [!Equals [!Join ["", !Ref SubnetIds], ""]]
+
+Resources:
+  # ---------------------------------------------------------------- Lambda
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !If
+          - UseVpc
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: restore-test-worker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - backup:DescribeRestoreJob
+                  - backup:PutRestoreValidationResult
+                  - rds:DescribeDBClusters
+                  - rds:DescribeDBInstances
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - rds:CreateDBInstance
+                  - rds:AddTagsToResource
+                Resource: "*"
+              - Sid: OnlyDeleteInstancesThisStackCreated
+                Effect: Allow
+                Action: rds:DeleteDBInstance
+                Resource: !Sub arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:db:*
+                Condition:
+                  StringEquals:
+                    "rds:db-tag/restore-test-automation": "true"
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Aurora restore-test worker (prepare/create/status/validate/report/delete)
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt WorkerRole.Arn
+      Environment:
+        Variables:
+          INSTANCE_CLASS: !Ref InstanceClass
+          PLAN_ARN: !Ref RestoreTestingPlanArn
+          MAX_ATTEMPTS: !Ref MaxWaitMinutes
+      VpcConfig: !If
+        - UseVpc
+        - SubnetIds: !Ref SubnetIds
+          SecurityGroupIds: !Ref SecurityGroupIds
+        - !Ref AWS::NoValue
+      Code:
+        ZipFile: |
+          import os, boto3
+          bk = boto3.client('backup')
+          rds = boto3.client('rds')
+          TAG = 'restore-test-automation'
+
+          class NotReady(Exception):
+              pass
+
+          def handler(e, _):
+              return globals()['do_' + e['action']](e.get('ctx', e))
+
+          def do_prepare(c):
+              j = bk.describe_restore_job(RestoreJobId=c['restoreJobId'])
+              plan = (j.get('CreatedBy') or {}).get('RestoreTestingPlanArn')
+              want = os.environ.get('PLAN_ARN')
+              arn = j.get('CreatedResourceArn', '')
+              if not plan or (want and plan != want) or ':cluster:' not in arn:
+                  return {'skip': True}
+              cid = arn.split(':')[-1]
+              cl = rds.describe_db_clusters(DBClusterIdentifier=cid)['DBClusters'][0]
+              if not cl['Engine'].startswith('aurora'):
+                  return {'skip': True}
+              return {'skip': False, 'restoreJobId': c['restoreJobId'],
+                      'clusterId': cid, 'engine': cl['Engine'], 'attempts': 0,
+                      'maxAttempts': int(os.environ['MAX_ATTEMPTS']),
+                      'instanceId': cid[:55].rstrip('-').lower() + '-rt'}
+
+          def do_create(c):
+              try:
+                  rds.create_db_instance(
+                      DBInstanceIdentifier=c['instanceId'],
+                      DBClusterIdentifier=c['clusterId'],
+                      DBInstanceClass=os.environ['INSTANCE_CLASS'],
+                      Engine=c['engine'],
+                      Tags=[{'Key': TAG, 'Value': 'true'}])
+              except rds.exceptions.DBInstanceAlreadyExistsFault:
+                  pass
+              return {}
+
+          def do_status(c):
+              try:
+                  i = rds.describe_db_instances(DBInstanceIdentifier=c['instanceId'])
+                  return {'status': i['DBInstances'][0]['DBInstanceStatus']}
+              except rds.exceptions.DBInstanceNotFoundFault:
+                  return {'status': 'not-found'}
+
+          def do_validate(c):
+              cl = rds.describe_db_clusters(DBClusterIdentifier=c['clusterId'])['DBClusters'][0]
+              writer = any(m['IsClusterWriter'] for m in cl['DBClusterMembers'])
+              ok = cl['Status'] == 'available' and writer
+              # Add your own checks here, e.g. connect to cl['Endpoint'] and
+              # run queries (requires VPC config + a DB driver layer).
+              return {'status': 'SUCCESSFUL' if ok else 'FAILED',
+                      'message': f"cluster={cl['Status']} writer={writer} endpoint={cl.get('Endpoint')}"}
+
+          def do_report(c):
+              v = c['validation']
+              bk.put_restore_validation_result(
+                  RestoreJobId=c['restoreJobId'],
+                  ValidationStatus=v['status'],
+                  ValidationStatusMessage=v['message'][:250])
+              return {}
+
+          def do_delete(c):
+              try:
+                  rds.delete_db_instance(DBInstanceIdentifier=c['instanceId'])
+              except rds.exceptions.DBInstanceNotFoundFault:
+                  pass
+              except rds.exceptions.InvalidDBInstanceStateFault:
+                  raise NotReady('instance busy, retrying')
+              return {}
+
+  # ---------------------------------------------------------------- Step Functions
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-worker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt WorkerFunction.Arn
+                  - !Sub "${WorkerFunction.Arn}:*"
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionSubstitutions:
+        Fn: !GetAtt WorkerFunction.Arn
+      Definition:
+        Comment: Add instance to restored Aurora cluster, validate, report, clean up
+        StartAt: Prepare
+        States:
+          Prepare:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${Fn}
+              Payload:
+                action: prepare
+                restoreJobId.$: $.detail.restoreJobId
+            OutputPath: $.Payload
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: ShouldSkip
+
+          ShouldSkip:
+            Type: Choice
+            Choices:
+              - Variable: $.skip
+                BooleanEquals: true
+                Next: NotAnAuroraRestoreTest
+            Default: CreateInstance
+
+          NotAnAuroraRestoreTest:
+            Type: Succeed
+
+          CreateInstance:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${Fn}
+              Payload: { action: create, ctx.$: $ }
+            ResultPath: null
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: AutomationError
+            Next: WaitForInstance
+
+          WaitForInstance:
+            Type: Wait
+            Seconds: 60
+            Next: CheckInstance
+
+          CheckInstance:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${Fn}
+              Payload: { action: status, ctx.$: $ }
+            ResultSelector:
+              status.$: $.Payload.status
+            ResultPath: $.instance
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: AutomationError
+            Next: IncrementAttempts
+
+          IncrementAttempts:
+            Type: Pass
+            Parameters:
+              value.$: States.MathAdd($.attempts, 1)
+            ResultPath: $.counter
+            Next: IsInstanceReady
+
+          IsInstanceReady:
+            Type: Choice
+            Choices:
+              - Variable: $.instance.status
+                StringEquals: available
+                Next: Validate
+              - Or:
+                  - Variable: $.instance.status
+                    StringEquals: failed
+                  - Variable: $.instance.status
+                    StringEquals: storage-full
+                  - Variable: $.instance.status
+                    StringMatches: "incompatible*"
+                  - Variable: $.instance.status
+                    StringMatches: "inaccessible*"
+                Next: InstanceFailed
+              - Variable: $.counter.value
+                NumericGreaterThanEqualsPath: $.maxAttempts
+                Next: InstanceTimedOut
+            Default: SaveAttempts
+
+          SaveAttempts:
+            Type: Pass
+            InputPath: $.counter.value
+            ResultPath: $.attempts
+            Next: WaitForInstance
+
+          InstanceFailed:
+            Type: Pass
+            Parameters:
+              status: FAILED
+              message.$: "States.Format('Instance entered state {}', $.instance.status)"
+            ResultPath: $.validation
+            Next: ReportResult
+
+          InstanceTimedOut:
+            Type: Pass
+            Parameters:
+              status: FAILED
+              message.$: "States.Format('Instance not available after {} checks (last state {})', $.counter.value, $.instance.status)"
+            ResultPath: $.validation
+            Next: ReportResult
+
+          AutomationError:
+            Type: Pass
+            Parameters:
+              status: FAILED
+              message.$: "States.Format('Automation error: {}', $.error.Error)"
+            ResultPath: $.validation
+            Next: ReportResult
+
+          Validate:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${Fn}
+              Payload: { action: validate, ctx.$: $ }
+            ResultSelector:
+              status.$: $.Payload.status
+              message.$: $.Payload.message
+            ResultPath: $.validation
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: AutomationError
+            Next: ReportResult
+
+          ReportResult:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${Fn}
+              Payload: { action: report, ctx.$: $ }
+            ResultPath: null
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.reportError
+                Next: DeleteInstance
+            Next: DeleteInstance
+
+          DeleteInstance:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${Fn}
+              Payload: { action: delete, ctx.$: $ }
+            ResultPath: null
+            Retry:
+              - ErrorEquals: [NotReady]
+                IntervalSeconds: 60
+                MaxAttempts: 45
+                BackoffRate: 1
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: Outcome
+
+          Outcome:
+            Type: Choice
+            Choices:
+              - Variable: $.validation.status
+                StringEquals: SUCCESSFUL
+                Next: Passed
+            Default: ValidationFailed
+
+          Passed:
+            Type: Succeed
+
+          ValidationFailed:
+            Type: Fail
+            Error: RestoreValidationFailed
+            Cause: Restore test validation failed; see execution input/output for details.
+
+  # ---------------------------------------------------------------- EventBridge
+  EventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-execution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref StateMachine
+
+  RestoreCompletedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: AWS Backup restore job completed -> Aurora restore-test validation
+      State: ENABLED
+      EventPattern:
+        source: [aws.backup]
+        detail-type: [Restore Job State Change]
+        detail:
+          status: [COMPLETED]
+      Targets:
+        - Id: aurora-restore-test
+          Arn: !Ref StateMachine
+          RoleArn: !GetAtt EventsRole.Arn
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref StateMachine
+  WorkerFunctionArn:
+    Value: !GetAtt WorkerFunction.Arn
